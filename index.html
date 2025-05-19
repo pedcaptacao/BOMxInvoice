@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Conferência BOM × Invoice</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+    th, td { border: 1px solid #ccc; padding: 6px; }
+    .ok { background: #e0ffe0; }
+    .alert { background: #ffe0e0; }
+    #modal { display: none; position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; }
+    #modal .content { background:white; padding:20px; width:400px; max-height:80%; overflow:auto; }
+    #modal table { width:100%; }
+  </style>
+</head>
+<body>
+  <h1>Conferência BOM × Invoice</h1>
+  <div>
+    <input id="bom-file" type="file" accept=".csv,.xlsx"> BOM interna<br><br>
+    <input id="inv-file" type="file" accept=".csv,.xlsx"> Invoice<br><br>
+    <button id="process-btn">Processar</button>
+    <button id="edit-btn">Editar Equivalências</button>
+  </div>
+  <div id="grid"></div>
+
+  <!-- Modal de edição de equivalências -->
+  <div id="modal">
+    <div class="content">
+      <h2>Equivalências</h2>
+      <table id="eq-table">
+        <thead><tr><th>PN Fabricante</th><th>PN Interno</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <button id="save-eq">Salvar</button>
+      <button id="close-modal">Fechar</button>
+    </div>
+  </div>
+
+  <!-- Carrega SDKs na ordem correta -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+
+  <!-- Seu código -->
+  <script>
+    console.log('Script carregado');
+
+    // 1) Cria o client sem sobrescrever o global
+    const supabaseUrl    = 'https://uyloqkiqpvresyqiffcn.supabase.co';
+    const supabaseKey    = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV5bG9xa2lxcHZyZXN5cWlmZmNuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDc2Njk4NTksImV4cCI6MjA2MzI0NTg1OX0._6cZkTTH9fgW00KM1iZl9Z3BaGfh6UGz7zKv0vZPHn4';
+    const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey);
+
+    // 2) Leitura de arquivos
+    async function readFile(file) {
+      const name = file.name.toLowerCase();
+      const buffer = await file.arrayBuffer();
+      if (name.endsWith('.csv')) {
+        const text = new TextDecoder().decode(buffer);
+        return Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+      } else {
+        const wb = XLSX.read(buffer, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        return XLSX.utils.sheet_to_json(ws, { defval: '' });
+      }
+    }
+
+    // 3) Normalização de chaves
+    function normalize(rows) {
+      return rows.map(r => {
+        const o = {};
+        for (let k in r) {
+          const nk = k.trim().toLowerCase()
+                     .replace(/\s+/g, '_')
+                     .replace(/[()]/g, '')
+                     .replace(/[^a-z0-9_]/g,'');
+          o[nk] = r[k];
+        }
+        return o;
+      });
+    }
+
+    // 4) CRUD de equivalências com o client correto
+    async function loadEquivs() {
+      console.log('Carregando equivalências…');
+      const { data, error } = await supabaseClient
+        .from('equivalencias')
+        .select('pn_fabricante,pn_interno');
+      if (error) {
+        console.error('Erro ao carregar equivalências:', error);
+        return {};
+      }
+      const eqs = {};
+      (data || []).forEach(r => eqs[r.pn_fabricante] = r.pn_interno);
+      console.log('Equivalências:', eqs);
+      return eqs;
+    }
+
+    async function saveEquiv(pn_fab, pn_int) {
+      const { error } = await supabaseClient
+        .from('equivalencias')
+        .upsert({ pn_fabricante: pn_fab, pn_interno: pn_int });
+      if (error) console.error('Erro ao salvar equivalência:', error);
+    }
+
+    // 5) Tratamento do clique em Processar
+    document.getElementById('process-btn').addEventListener('click', async () => {
+      console.log('Processar clicado');
+      const bomFile = document.getElementById('bom-file').files[0];
+      const invFile = document.getElementById('inv-file').files[0];
+      if (!bomFile || !invFile) {
+        alert('Selecione ambos os arquivos');
+        return;
+      }
+      let [bom, inv, eqs] = await Promise.all([
+        readFile(bomFile),
+        readFile(invFile),
+        loadEquivs()
+      ]);
+      bom = normalize(bom);
+      inv = normalize(inv);
+
+      const grid = document.createElement('table');
+      const header = grid.insertRow();
+      ['PN fabricante','PN interno','Qty BOM','Qty Invoice','Status']
+        .forEach(t => {
+          const th = document.createElement('th');
+          th.textContent = t;
+          header.appendChild(th);
+        });
+
+      bom.forEach(r => {
+        const pn     = String(r.pn_fabricante||'').trim();
+        const bomQty = +r.bom_qty || 0;
+        const match  = inv.find(i => String(i.pn_fabricante||'').trim()===pn);
+        const invQty = match? (+match.qty_pcs||0) : 0;
+        const pnInt  = eqs[pn]||'';
+        let status   = 'OK';
+        if (!pnInt && !match) status = 'PN não encontrado';
+        else if (invQty !== bomQty) status = 'Qtd divergente';
+        const rowEl = grid.insertRow();
+        rowEl.className = status==='OK'? 'ok':'alert';
+        [pn,pnInt,bomQty,invQty,status].forEach(v=>rowEl.insertCell().textContent=v);
+      });
+
+      const cont = document.getElementById('grid');
+      cont.innerHTML = '';
+      cont.appendChild(grid);
+    });
+
+    // 6) Modal de Equivalências
+    const modal = document.getElementById('modal');
+    document.getElementById('edit-btn').addEventListener('click', async () => {
+      const eqs   = await loadEquivs();
+      const tbody = document.querySelector('#eq-table tbody');
+      tbody.innerHTML = '';
+      Object.entries(eqs).forEach(([k,v])=>{
+        const tr  = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = k;
+        const td2 = document.createElement('td');
+        const inp = document.createElement('input'); inp.value = v;
+        td2.appendChild(inp);
+        tr.append(td1,td2);
+        tbody.appendChild(tr);
+      });
+      modal.style.display = 'flex';
+    });
+    document.getElementById('save-eq').addEventListener('click', async () => {
+      for (const tr of document.querySelectorAll('#eq-table tbody tr')) {
+        const k = tr.cells[0].textContent;
+        const v = tr.querySelector('input').value;
+        if (k) await saveEquiv(k,v);
+      }
+      modal.style.display = 'none';
+      alert('Equivalências salvas!');
+    });
+    document.getElementById('close-modal').addEventListener('click', ()=> modal.style.display='none');
+  </script>
+</body>
+</html>
